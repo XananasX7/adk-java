@@ -31,6 +31,7 @@ import com.google.genai.types.FinishReason.Known;
 import com.google.genai.types.FunctionCall;
 import com.google.genai.types.GenerateContentResponseUsageMetadata;
 import com.google.genai.types.Part;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -354,6 +355,16 @@ public final class ChatCompletionsResponse {
 
     /** See class definition for more details. */
     public Audio audio;
+
+    /**
+     * Message-level additional parameters used by some providers. For example, Google Gemini's
+     * OpenAI-compatible {@code /chat/completions} endpoint emits {@code
+     * extra_content.google.thought_signature} on the assistant message (separately from any
+     * tool_call signatures) when the response is plain text; the signature must be echoed back on
+     * subsequent turns or Gemini may retry or loop.
+     */
+    @JsonProperty("extra_content")
+    public Map<String, Object> extraContent;
   }
 
   /**
@@ -528,6 +539,15 @@ public final class ChatCompletionsResponse {
     private Usage usage;
     private final Map<String, String> customMetadataMap = new HashMap<>();
 
+    /**
+     * Base64-encoded thought_signature attached at the message level for the assistant text
+     * response, captured from any chunk that carries {@code
+     * delta.extra_content.google.thought_signature}. Gemini's OpenAI-compatible endpoint emits this
+     * on a dedicated chunk (alongside finish_reason=stop) for plain-text turns; if not
+     * round-tripped, Gemini may retry or loop on subsequent turns.
+     */
+    private byte[] accumulatedTextThoughtSignature;
+
     private ImmutableList<CustomMetadata> getCustomMetadataList() {
       ImmutableList.Builder<CustomMetadata> list = ImmutableList.builder();
       for (Entry<String, String> entry : customMetadataMap.entrySet()) {
@@ -566,13 +586,53 @@ public final class ChatCompletionsResponse {
 
       ImmutableList<Part> chunkParts = mapDeltaToParts(choice);
 
-      responses.add(buildPartialResponse(chunkParts));
+      // Emit a partial response only when this chunk's delta carried actual content. On the
+      // finish chunk, emit TWO non-partial events to mirror Gemini.processStreamingResponses:
+      //   (A) An aggregated-text event (only when text was streamed) carrying the full
+      //       accumulated text in a single Part, with NO finishReason. The UI relies on
+      //       this to commit the streaming bubble's content.
+      //   (B) A metadata-final event carrying the FinishReason and the accumulated tool_call
+      //       Parts (with args parsed) but NO text. The accumulated text is intentionally
+      //       excluded from the metadata-final to prevent the UI from rendering it as appended
+      //       content to the just-committed bubble.
+      //
+      // This shape is known to still trigger UI rendering defects intermittently (occasional
+      // duplicate bubbles on rapid back-to-back text turns; empty skeleton bubbles after
+      // multi-agent transfers); however, alternative shapes cause worse regressions (no streaming
+      // progression, missing commits, mid-bubble repetition). The underlying defect lives in the UI
+      // streaming renderer. This emit shape is the least-bad option pending a UI-side fix.
+      if (!chunkParts.isEmpty()) {
+        responses.add(buildPartialResponse(chunkParts));
+      }
 
       if (choice.finishReason != null && !choice.finishReason.isEmpty()) {
+        if (contentParts.length() > 0) {
+          responses.add(buildAggregatedTextResponse());
+        }
         responses.add(buildFinalResponse(choice));
       }
 
       return responses.build();
+    }
+
+    /**
+     * Builds the aggregated-text event for the finish chunk: a non-partial response whose content
+     * is a single text Part containing the fully-accumulated streamed text, with NO finishReason.
+     * Mirrors {@code Gemini.processStreamingResponses}'s aggregated-text emit at close-of-stream.
+     * See {@link #processChunk} for rationale.
+     */
+    private LlmResponse buildAggregatedTextResponse() {
+      Part textPart = Part.fromText(contentParts.toString());
+      if (accumulatedTextThoughtSignature != null) {
+        textPart = textPart.toBuilder().thoughtSignature(accumulatedTextThoughtSignature).build();
+      }
+      ImmutableList<Part> parts = ImmutableList.of(textPart);
+      return LlmResponse.builder()
+          .content(Content.builder().role(this.role).parts(parts).build())
+          .modelVersion(this.model)
+          .usageMetadata(mapUsage(this.usage))
+          .customMetadata(getCustomMetadataList())
+          .build();
     }
 
     /**
@@ -633,11 +693,32 @@ public final class ChatCompletionsResponse {
       ImmutableList.Builder<Part> chunkParts = ImmutableList.builder();
       if (choice.delta != null) {
         updateRole(choice.delta.role);
+        captureMessageThoughtSignature(choice.delta.extraContent);
         appendContent(choice.delta.content, chunkParts);
         appendRefusal(choice.delta.refusal, chunkParts);
-        appendToolCalls(choice.delta.toolCalls, chunkParts);
+        accumulateToolCalls(choice.delta.toolCalls);
       }
       return chunkParts.build();
+    }
+
+    /**
+     * Reads the message-level {@code extra_content.google.thought_signature} (if present) from a
+     * streaming delta and stores it for later attachment to the accumulated text Part. Gemini's
+     * OpenAI-compatible endpoint emits this signature on a final chunk that may carry no other
+     * content; without round-tripping it on the next turn, Gemini may retry the response.
+     */
+    private void captureMessageThoughtSignature(@Nullable Map<String, Object> extraContent) {
+      if (extraContent == null || !extraContent.containsKey("google")) {
+        return;
+      }
+      Object googleObj = extraContent.get("google");
+      if (!(googleObj instanceof Map<?, ?> googleMap)) {
+        return;
+      }
+      Object sigObj = googleMap.get("thought_signature");
+      if (sigObj instanceof String sig) {
+        accumulatedTextThoughtSignature = Base64.getDecoder().decode(sig);
+      }
     }
 
     /**
@@ -684,20 +765,16 @@ public final class ChatCompletionsResponse {
     }
 
     /**
-     * Appends tool calls to the accumulator and adds them to the chunk parts.
+     * Accumulates streaming tool calls across multiple chunks. To prevent downstream flows from
+     * dispatching the same tool multiple times, partial tool calls are NOT emitted. The
+     * fully-accumulated tool call is emitted exactly once via {@link #buildFinalResponse}.
      *
      * @param toolCalls the list of tool calls, or {@code null}.
-     * @param chunkParts the list of parts for this chunk.
      */
-    private void appendToolCalls(
-        @Nullable List<ChatCompletionsCommon.ToolCall> toolCalls,
-        ImmutableList.Builder<Part> chunkParts) {
+    private void accumulateToolCalls(@Nullable List<ChatCompletionsCommon.ToolCall> toolCalls) {
       if (toolCalls != null) {
         for (ChatCompletionsCommon.ToolCall toolCall : toolCalls) {
-          Part p = upsertToolCall(toolCall);
-          if (p != null) {
-            chunkParts.add(p);
-          }
+          Part unused = upsertToolCall(toolCall);
         }
       }
     }
@@ -719,19 +796,67 @@ public final class ChatCompletionsResponse {
     }
 
     /**
-     * Builds the final {@link LlmResponse} with all accumulated content.
+     * Builds the final non-partial {@link LlmResponse} for a streaming turn. Carries the
+     * FinishReason and the accumulated tool calls, but excludes the accumulated text (which is
+     * delivered exclusively via per-chunk partial responses). See {@link #processChunk} for the
+     * rationale.
      *
      * @param choice the choice containing the finish reason.
      * @return the final response.
      */
     private LlmResponse buildFinalResponse(ChunkChoice choice) {
+      ImmutableList<Part> finalParts = getFinalToolCallParts();
       return LlmResponse.builder()
-          .content(Content.builder().role(this.role).parts(getContentParts()).build())
+          .content(Content.builder().role(this.role).parts(finalParts).build())
           .finishReason(ChatCompletionsResponse.mapFinishReason(choice.finishReason))
           .modelVersion(this.model)
           .usageMetadata(mapUsage(this.usage))
           .customMetadata(getCustomMetadataList())
           .build();
+    }
+
+    /**
+     * Returns ONLY the accumulated tool_call Parts. Used by {@link #buildFinalResponse}; the
+     * accumulated text is emitted via per-chunk partial responses.
+     *
+     * <p>If a server emits non-contiguous tool_call indices (e.g. keys 0 and 2 but not 1), the
+     * present keys are iterated in sorted order and squashed into dense list positions (0 and 1) in
+     * the returned list.
+     *
+     * <p>Tool-call Parts carry their own per-tool-call thought_signature (attached via {@link
+     * ChatCompletionsCommon.ToolCall#applyThoughtSignature}). If a Part lacks one, the
+     * message-level {@code accumulatedTextThoughtSignature} (if any) is backfilled so the assistant
+     * turn round-trips with a signature. An existing per-tool-call signature is never overwritten.
+     */
+    private ImmutableList<Part> getFinalToolCallParts() {
+      ImmutableList.Builder<Part> parts = ImmutableList.builder();
+      ImmutableList<Integer> sortedKeys = ImmutableList.sortedCopyOf(toolCallParts.keySet());
+      for (int index : sortedKeys) {
+        Part part = toolCallParts.get(index);
+        if (part != null && part.functionCall().isPresent()) {
+          FunctionCall fc = part.functionCall().get();
+          StringBuilder argsSb = toolCallArgsAccumulator.get(index);
+          if (argsSb != null && argsSb.length() > 0) {
+            try {
+              Map<String, Object> args =
+                  objectMapper.readValue(
+                      argsSb.toString(), new TypeReference<Map<String, Object>>() {});
+              fc = fc.toBuilder().args(args).build();
+              part = part.toBuilder().functionCall(fc).build();
+            } catch (JsonProcessingException e) {
+              throw new IllegalArgumentException(
+                  "Failed to parse final tool call arguments: " + argsSb, e);
+            }
+          }
+        }
+        if (part != null
+            && accumulatedTextThoughtSignature != null
+            && part.thoughtSignature().isEmpty()) {
+          part = part.toBuilder().thoughtSignature(accumulatedTextThoughtSignature).build();
+        }
+        parts.add(part);
+      }
+      return parts.build();
     }
 
     /**
@@ -816,39 +941,6 @@ public final class ChatCompletionsResponse {
         chunkPart = toolCall.applyThoughtSignature(chunkPart);
       }
       return chunkPart;
-    }
-
-    private ImmutableList<Part> getContentParts() {
-      ImmutableList.Builder<Part> parts = ImmutableList.builder();
-      if (contentParts.length() > 0) {
-        parts.add(Part.fromText(contentParts.toString()));
-      }
-
-      // If a server sends keys 0 and 2 but not 1 then squash the indices and
-      // return parts at indices 0 and 1.
-      ImmutableList<Integer> sortedKeys = ImmutableList.sortedCopyOf(toolCallParts.keySet());
-
-      for (int index : sortedKeys) {
-        Part part = toolCallParts.get(index);
-        if (part != null && part.functionCall().isPresent()) {
-          FunctionCall fc = part.functionCall().get();
-          StringBuilder argsSb = toolCallArgsAccumulator.get(index);
-          if (argsSb != null && argsSb.length() > 0) {
-            try {
-              Map<String, Object> args =
-                  objectMapper.readValue(
-                      argsSb.toString(), new TypeReference<Map<String, Object>>() {});
-              fc = fc.toBuilder().args(args).build();
-              part = part.toBuilder().functionCall(fc).build();
-            } catch (JsonProcessingException e) {
-              throw new IllegalArgumentException(
-                  "Failed to parse final tool call arguments: " + argsSb, e);
-            }
-          }
-        }
-        parts.add(part);
-      }
-      return parts.build();
     }
   }
 }

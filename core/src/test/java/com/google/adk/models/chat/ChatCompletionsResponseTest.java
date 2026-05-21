@@ -767,7 +767,11 @@ public final class ChatCompletionsResponseTest {
             .modelVersion("")
             .build();
 
-    LlmResponse finalResponse = responses.get(1);
+    // Tool call deltas are accumulated across chunks 1-4 without emitting partial responses.
+    // Chunk 5 (finish_reason=tool_calls) emits a single metadata-final response carrying the fully
+    // accumulated tool calls and the FinishReason. Size 1.
+    assertThat(responses).hasSize(1);
+    LlmResponse finalResponse = responses.get(0);
 
     assertThat(finalResponse).isEqualTo(expectedFinalResponse);
   }
@@ -800,21 +804,31 @@ public final class ChatCompletionsResponseTest {
         collection.processChunk(
             objectMapper.readValue(chunk3Json, ChatCompletionsResponse.ChatCompletionChunk.class));
 
-    LlmResponse expectedFinalResponse =
+    // For a text-only turn, the finish_reason chunk emits TWO non-partial responses:
+    // (A) an aggregated-text response with the full text but NO finishReason.
+    // (B) a metadata-final response with FinishReason=STOP and no text parts.
+    // See ChatCompletionsResponse.processChunk for rationale. Size 2.
+    LlmResponse expectedAggregatedTextResponse =
         LlmResponse.builder()
             .content(
                 Content.builder()
                     .role("")
                     .parts(ImmutableList.of(Part.fromText("Hello World!")))
                     .build())
+            .customMetadata(ImmutableList.of())
+            .modelVersion("")
+            .build();
+    LlmResponse expectedFinalResponse =
+        LlmResponse.builder()
+            .content(Content.builder().role("").parts(ImmutableList.of()).build())
             .finishReason(new FinishReason(Known.STOP.toString()))
             .customMetadata(ImmutableList.of())
             .modelVersion("")
             .build();
 
-    LlmResponse finalResponse = responses.get(1);
-
-    assertThat(finalResponse).isEqualTo(expectedFinalResponse);
+    assertThat(responses)
+        .containsExactly(expectedAggregatedTextResponse, expectedFinalResponse)
+        .inOrder();
   }
 
   @Test
@@ -838,21 +852,30 @@ public final class ChatCompletionsResponseTest {
         collection.processChunk(
             objectMapper.readValue(chunk2Json, ChatCompletionsResponse.ChatCompletionChunk.class));
 
-    LlmResponse expectedFinalResponse =
+    // Similar to testChunkCollection_simpleText: chunk 1 streams the refusal, then chunk 2
+    // (finish_reason) emits an aggregated-text response with the full refusal text, followed
+    // by a metadata-final response with FinishReason and no text parts. Size 2.
+    LlmResponse expectedAggregatedTextResponse =
         LlmResponse.builder()
             .content(
                 Content.builder()
                     .role("")
                     .parts(ImmutableList.of(Part.fromText("I cannot do that.")))
                     .build())
+            .customMetadata(ImmutableList.of())
+            .modelVersion("")
+            .build();
+    LlmResponse expectedFinalResponse =
+        LlmResponse.builder()
+            .content(Content.builder().role("").parts(ImmutableList.of()).build())
             .finishReason(new FinishReason(Known.STOP.toString()))
             .customMetadata(ImmutableList.of())
             .modelVersion("")
             .build();
 
-    LlmResponse finalResponse = responses.get(1);
-
-    assertThat(finalResponse).isEqualTo(expectedFinalResponse);
+    assertThat(responses)
+        .containsExactly(expectedAggregatedTextResponse, expectedFinalResponse)
+        .inOrder();
   }
 
   @Test

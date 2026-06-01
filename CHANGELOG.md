@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.5.0](https://github.com/google/adk-java/compare/v1.4.0...v1.5.0) (2026-06-01)
+
+
+### Features
+
+* support optional types in function tool parameters ([9a06dd3](https://github.com/google/adk-java/commit/9a06dd34dc823af54d3ea229a0d141768593d376))
+
+
+### Bug Fixes
+
+* SkillMdPath should be public ([29d3203](https://github.com/google/adk-java/commit/29d3203a6fab4268a3588acddde7b59c73f7b624))
+
 ## [1.4.0](https://github.com/google/adk-java/compare/v1.3.0...v1.4.0) (2026-05-29)
 
 
